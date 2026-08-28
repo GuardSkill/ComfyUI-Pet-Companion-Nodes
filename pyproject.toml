@@ -20,7 +20,7 @@ Documentation = "https://github.com/GuardSkill/ComfyUI-Pet-Companion-Nodes#readm
 "Bug Tracker" = "https://github.com/GuardSkill/ComfyUI-Pet-Companion-Nodes/issues"
 
 [tool.comfy]
-PublisherId = "GuardSkill"
+PublisherId = "guardskill"
 DisplayName = "Pet Companion Nodes"
 Icon = ""
 includes = []
