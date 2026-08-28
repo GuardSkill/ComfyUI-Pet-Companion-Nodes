@@ -3,6 +3,7 @@ __pycache__/
 .git/
 .github/
 tests/
+node.zip
 *.webp
 *.png
 *.mp4

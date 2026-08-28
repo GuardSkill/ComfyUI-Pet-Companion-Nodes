@@ -5,6 +5,7 @@ __pycache__/
 .venv/
 dist/
 build/
+node.zip
 *.webp
 *.png
 *.mp4
