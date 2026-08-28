@@ -1,0 +1,26 @@
+[project]
+name = "pet-companion-nodes"
+description = "Green-screen cleanup, chroma keying, despill, and exact closed-loop transparent WebP export nodes for ComfyUI."
+version = "1.0.0"
+requires-python = ">=3.9"
+dependencies = [
+  "numpy>=1.24",
+  "opencv-python>=4.8",
+  "Pillow>=9.5",
+]
+license = { file = "LICENSE" }
+readme = "README.md"
+classifiers = [
+  "Operating System :: OS Independent",
+]
+
+[project.urls]
+Repository = "https://github.com/GuardSkill/ComfyUI-Pet-Companion-Nodes"
+Documentation = "https://github.com/GuardSkill/ComfyUI-Pet-Companion-Nodes#readme"
+"Bug Tracker" = "https://github.com/GuardSkill/ComfyUI-Pet-Companion-Nodes/issues"
+
+[tool.comfy]
+PublisherId = "GuardSkill"
+DisplayName = "Pet Companion Nodes"
+Icon = ""
+includes = []
