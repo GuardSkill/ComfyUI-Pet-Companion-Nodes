@@ -54,3 +54,16 @@ def test_normalizer_preserves_interior_subject(tmp_path):
     assert torch.allclose(normalized[0, 0, 0], torch.tensor([0.0, 1.0, 0.0]))
     expected = torch.tensor([204, 51, 25], dtype=torch.float32) / 255.0
     assert torch.allclose(normalized[0, 32, 32], expected)
+
+
+def test_normalizer_composites_rgba_instead_of_revealing_hidden_rgb(tmp_path):
+    module = load_module(tmp_path)
+    source = torch.zeros((1, 64, 64, 4), dtype=torch.float32)
+    source[..., :3] = 0.45  # Invisible grey RGB left by an image generator.
+    source[:, 20:44, 20:44, :3] = torch.tensor((0.8, 0.2, 0.1))
+    source[:, 20:44, 20:44, 3] = 1.0
+    source[:, 19, 20:44, 3] = 0.5
+    output = module.PetNormalizeGreenFirstFrame().normalize(source, "#00FF00", 0.30, 1)[0]
+    assert torch.allclose(output[0, 0, 0], torch.tensor((0.0, 1.0, 0.0)))
+    assert torch.allclose(output[0, 32, 32], torch.tensor((0.8, 0.2, 0.1)), atol=0.005)
+    assert float(output[0, 19, 22, 1]) > 0.5

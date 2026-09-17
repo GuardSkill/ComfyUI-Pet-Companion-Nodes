@@ -34,7 +34,11 @@ def _edge_connected(candidate: np.ndarray) -> np.ndarray:
         return np.zeros_like(candidate, dtype=bool)
     edge_labels = np.unique(np.concatenate((labels[0], labels[-1], labels[:, 0], labels[:, -1])))
     edge_labels = edge_labels[edge_labels != 0]
-    return np.isin(labels, edge_labels)
+    # np.isin on a large label image and thousands of tiny compressed-video
+    # components can become extremely slow. Label-index lookup is linear.
+    selected = np.zeros(count, dtype=bool)
+    selected[edge_labels] = True
+    return selected[labels]
 
 
 def _alpha_and_despill(
@@ -56,6 +60,10 @@ def _alpha_and_despill(
     # Suppress green spill only near the keyed boundary, leaving interior coat colors intact.
     output = rgb.copy()
     edge_weight = np.clip((1.0 - alpha) + cv2.GaussianBlur(1.0 - alpha, (0, 0), 1.25), 0.0, 1.0)
+    # GIF transparency is binary. Fully despill a narrow foreground band as
+    # well, or the first opaque pixel becomes a visible neon-green outline.
+    boundary_band = cv2.dilate((alpha < 0.95).astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
+    edge_weight = np.where(boundary_band, 1.0, edge_weight)
     rb_max = np.maximum(output[..., 0], output[..., 2])
     excess = np.maximum(output[..., 1] - rb_max, 0.0)
     output[..., 1] -= excess * edge_weight * despill
@@ -93,10 +101,24 @@ class PetNormalizeGreenFirstFrame:
     CATEGORY = "Pet Companion/Green Screen"
 
     def normalize(self, image, key_color, background_tolerance, edge_feather):
+        raw = image.detach().cpu().numpy()
+        if raw.ndim != 4 or raw.shape[-1] not in (3, 4):
+            raise ValueError("image must be a batch of RGB or RGBA frames")
         frames = _rgb8(image)
         key = _parse_hex(key_color)
         result = []
-        for frame in frames:
+        for index, frame in enumerate(frames):
+            if raw.shape[-1] == 4:
+                # GPT Image returns RGBA. Hidden RGB under zero alpha is *not*
+                # background: treating it as visible creates a grey ghost halo.
+                alpha = np.clip(raw[index, ..., 3], 0.0, 1.0)
+                alpha = np.where(alpha < 0.04, 0.0, alpha)
+                alpha = np.where(alpha > 0.98, 1.0, alpha)
+                composite = frame.astype(np.float32) * alpha[..., None] + key * (1.0 - alpha[..., None])
+                result.append(np.clip(composite / 255.0, 0.0, 1.0).astype(np.float32))
+                continue
+            # Older RGB sources have no alpha and still need border-connected
+            # color detection; keep that fallback without applying it to RGBA.
             rgb = frame.astype(np.float32)
             border = np.concatenate((rgb[:8].reshape(-1, 3), rgb[-8:].reshape(-1, 3), rgb[:, :8].reshape(-1, 3), rgb[:, -8:].reshape(-1, 3)))
             inferred = np.median(border, axis=0)
@@ -182,12 +204,90 @@ class PetChromaKeyClosedLoopWebP:
         return {"ui": {"images": [ui_item]}, "result": (preview_tensor, mask_tensor, str(target))}
 
 
+class PetChromaKeyClosedLoopGIF:
+    """Remove an edge-connected green screen and save a transparent animated GIF."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "filename_prefix": ("STRING", {"default": "pet_companion/loop"}),
+                "fps": ("FLOAT", {"default": 28.0, "min": 1.0, "max": 120.0, "step": 0.01}),
+                "key_color": ("STRING", {"default": "#00FF00"}),
+                "similarity": ("FLOAT", {"default": 0.16, "min": 0.01, "max": 0.70, "step": 0.01}),
+                "smoothness": ("FLOAT", {"default": 0.08, "min": 0.001, "max": 0.40, "step": 0.005}),
+                "despill": ("FLOAT", {"default": 0.90, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "alpha_threshold": ("INT", {"default": 96, "min": 1, "max": 254, "step": 1}),
+                "close_loop": ("BOOLEAN", {"default": False}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK", "STRING")
+    RETURN_NAMES = ("checker_preview", "foreground_mask", "saved_gif")
+    FUNCTION = "key_and_save_gif"
+    CATEGORY = "Pet Companion/Green Screen"
+    OUTPUT_NODE = True
+
+    def key_and_save_gif(self, images, filename_prefix, fps, key_color, similarity, smoothness, despill, alpha_threshold, close_loop):
+        frames = _rgb8(images)
+        if len(frames) < 2:
+            raise ValueError("At least two video frames are required")
+        key = _parse_hex(key_color)
+        rgba_frames = []
+        previews = []
+        masks = []
+        for frame in frames:
+            rgb, alpha = _alpha_and_despill(frame, key, similarity, smoothness, despill)
+            rgba_frames.append(np.dstack((np.round(rgb * 255.0).astype(np.uint8), np.round(alpha * 255.0).astype(np.uint8))))
+            masks.append(alpha)
+            yy, xx = np.indices(alpha.shape)
+            checker = np.where(((xx // 16 + yy // 16) % 2)[..., None] == 0, 0.18, 0.32).astype(np.float32)
+            previews.append(rgb * alpha[..., None] + checker * (1.0 - alpha[..., None]))
+
+        if close_loop:
+            rgba_frames[-1] = rgba_frames[0].copy()
+            previews[-1] = previews[0].copy()
+            masks[-1] = masks[0].copy()
+
+        subfolder, stem = _safe_prefix(filename_prefix)
+        target_dir = Path(folder_paths.get_output_directory()) / subfolder
+        target_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"{stem}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.gif"
+        target = target_dir / filename
+        # ComfyUI executes nodes off the main thread; forking ffmpeg after Numba
+        # or TBB initialization can hang. Pillow writes GIF without subprocesses.
+        pil_frames = []
+        for frame in rgba_frames:
+            frame = frame.copy()
+            frame[..., 3] = np.where(frame[..., 3] >= alpha_threshold, 255, 0).astype(np.uint8)
+            frame[frame[..., 3] == 0, :3] = 0
+            pil_frames.append(Image.fromarray(frame, "RGBA"))
+        pil_frames[0].save(
+            target,
+            format="GIF",
+            save_all=True,
+            append_images=pil_frames[1:],
+            duration=_durations(len(pil_frames), fps),
+            loop=0,
+            optimize=False,
+            disposal=2,
+        )
+
+        preview_tensor = torch.from_numpy(np.stack(previews).astype(np.float32))
+        mask_tensor = torch.from_numpy(np.stack(masks).astype(np.float32))
+        ui_item = {"filename": filename, "subfolder": subfolder.as_posix() if str(subfolder) != "." else "", "type": "output", "animated": True}
+        return {"ui": {"gifs": [ui_item]}, "result": (preview_tensor, mask_tensor, str(target))}
+
+
 NODE_CLASS_MAPPINGS = {
     "PetNormalizeGreenFirstFrame": PetNormalizeGreenFirstFrame,
     "PetChromaKeyClosedLoopWebP": PetChromaKeyClosedLoopWebP,
+    "PetChromaKeyClosedLoopGIF": PetChromaKeyClosedLoopGIF,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "PetNormalizeGreenFirstFrame": "Pet / Normalize Green First Frame",
     "PetChromaKeyClosedLoopWebP": "Pet / Chroma Key + Closed Loop WebP",
+    "PetChromaKeyClosedLoopGIF": "Pet / Chroma Key + Transparent GIF",
 }
